@@ -1,0 +1,112 @@
+# Controllable Text Summarization via Prompt Injection
+
+**Data Mining, Text Mining and Big Data Analytics — Modules 1 & 2 \|
+Course Project Proposal**
+
+*\[Name Surname\] · \[Name Surname\] \| Alma Mater Studiorum —
+Università di Bologna*
+
+**Topic.** Asking an LLM for “exactly 4 sentences” or “exactly 100
+words” often fails. We build one pipeline on a corpus stored in HDFS in
+which classic ML and LLMs work together. Stage 1 (Big Data, Spark
+MLlib): 3 ML algorithms score every article sentence and select the
+top-m. Stage 2 (Text Mining): the selected sentences are injected into
+the LLM prompt together with the control instruction, and small
+instruction-tuned LLMs are compared on exact length and format
+constraints, against prompts with the full article. “Prompt injection”
+here means inserting control instructions and selected content into the
+prompt; the articles are treated as untrusted data, never as
+instructions. All numbers are planned and will be verified at ingestion.
+
+## 1. Dataset & Scale Metrics
+
+Source: CNN/DailyMail v3.0.0 (311,971 news articles with reference
+highlights: 287,113 train / 13,368 validation / 11,490 test; Apache 2.0
+on the dataset card),
+<https://huggingface.co/datasets/abisee/cnn_dailymail>
+
+| Metric           | Planned value (Stage 1)                                                                             | Requirement       |
+|------------------|-----------------------------------------------------------------------------------------------------|-------------------|
+| N (patterns)     | about 700,000 sentences, from a seeded sample of about 25,000 articles (full corpus staged in HDFS) | N ≥ 20,000        |
+| p (features)     | 8 (8 numeric, 0 categorical)                                                                        | p ≥ 4             |
+| n_A (algorithms) | 3: Logistic Regression, Random Forest, Gradient-Boosted Trees                                       | n_A ≥ 3           |
+| N × p            | about 5,600,000 (still 4,000,000 even at only 20 sentences per article)                             | N × p ≥ 1,000,000 |
+
+Stage 2 (not counted in N): 50 held-out articles × 3 model systems × 5
+prompt strategies × 4 constraint tasks = 3,000 first-pass generations
+(to be re-sized after a pilot).
+
+## 2. Regarding p, Categorical Features, Infrastructure and Tools
+
+p = 8 counts raw features only: 8 numeric and 0 categorical, so no
+one-hot encoding is involved. The TF-IDF vectors (Spark ML Tokenizer,
+StopWordsRemover, HashingTF, IDF) are only an intermediate step to
+compute 2 of the 8 scalar features and are not counted in p. Labels come
+from the reference highlights, features never use them (no leakage), and
+the official article-level splits prevent sentences of one article from
+appearing in both train and test.
+
+Everything runs on the course virtual machine (Vagrant + VirtualBox,
+Ubuntu 24.04, Java 21, provisioned by the course bootstrap.sh of
+2025-12-16) with Hadoop 3.4.2 in pseudo-distributed mode and Spark 4.1.0
+in local mode. The notebook downloads the dataset and loads it into HDFS
+with explicit commands (hdfs dfs -mkdir -p /datasets/cnn_dailymail, hdfs
+dfs -put … /datasets/cnn_dailymail/); Spark then reads from
+hdfs://localhost:9000/datasets/…. Colab is not used for the Spark and
+HDFS analysis. The top-m sentences chosen by Stage 1 are written back to
+HDFS and read from there to build the Stage 2 prompts. Extra libraries
+(NLTK, rouge-score, Hugging Face Transformers) and all versions are
+listed in the first cell. LLM generation runs in the VM if the models
+fit; otherwise on the host or a GPU machine using article IDs and text
+read from HDFS, and the outputs are loaded back into HDFS as a table
+(documented, never described as VM inference).
+
+## 3. Proposed Analyses
+
+|                      | Stage 1: ML sentence selector (Spark MLlib)                                                                                                                                                                    | Stage 2: prompt injection and LLM generation                                                                                                                                                   |
+|----------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Pattern              | One article sentence                                                                                                                                                                                           | One generated summary (article × model × strategy × task)                                                                                                                                      |
+| Target               | 1 if the sentence is in the greedy oracle extractive summary built from the reference highlights, else 0                                                                                                       | 1 if the output satisfies the requested constraint (deterministic checker), else 0                                                                                                             |
+| Features / input     | Numeric: sentence position, relative position, length in words, number of digits, number of capitalized words, TF-IDF similarity to the article, similarity to the first sentence, article length in sentences | Prompt = control instruction + article text or the top-m (m = 8) sentences chosen by the best Stage 1 model                                                                                    |
+| Algorithms / systems | Logistic Regression, Random Forest, Gradient-Boosted Trees; hyperparameters tuned with CrossValidator; non-ML Lead-k baseline                                                                                  | FLAN-T5-base, Qwen2.5-0.5B-Instruct, BART-large-CNN (summarization baseline)                                                                                                                   |
+| Strategies / tasks   | Top-k selection (k = 4, 5) also gives a pure-ML summary                                                                                                                                                        | Strategies: zero-shot, explicit constraints, few-shot, ML-guided (top-m injected), Lead-m-guided (control). Tasks: exactly 4 sentences; exactly 100 words; at most 50 words; exactly 5 bullets |
+| NLP tools            | NLTK (sentence splitting); Spark ML TF-IDF; rouge-score (oracle labels, ROUGE)                                                                                                                                 | NLTK and custom validators (counting rules fixed and unit-tested before the test run); rouge-score; Transformers                                                                               |
+| Evaluation           | ROC-AUC, PR-AUC and F1 (imbalanced classes) on the test split; ROUGE-1/2/L of the top-k summaries                                                                                                              | Compliance rate and count error per task; ROUGE; manual factuality check on a fixed subset; truncation, latency and tokens; paired comparisons with confidence intervals                       |
+
+**How the stages connect:** Stage 1 output (ranked sentences, in HDFS)
+is the input of the ML-guided prompts in Stage 2. The pure-ML top-4
+summary is also compared with the LLMs on the same 50 held-out articles.
+
+### Research questions
+
+- **Stage 1:** Can sentences that enter the reference summary be
+  predicted from positional and lexical features? Do ensemble methods
+  beat Logistic Regression?
+
+- **Stage 2:** Which model and prompt strategy most reliably meets exact
+  sentence, word and bullet constraints? Does explicit wording or
+  few-shot beat zero-shot?
+
+- **Combined:** Does injecting ML-selected sentences improve compliance,
+  ROUGE and speed versus full-article prompts and versus Lead-m,
+  especially for models with short context? Does higher compliance cost
+  summary quality?
+
+## 4. Questions for the Professor
+
+- Do N ≈ 700,000 sentence patterns, p = 8 raw numeric features (TF-IDF
+  used only as an intermediate step) and n_A = 3 satisfy the Module 2
+  requirements?
+
+- Is it acceptable that the n_A = 3 algorithms are the
+  sentence-selection classifiers whose output feeds the LLM prompts,
+  with the LLMs compared as systems and not counted among them?
+
+- Is it acceptable to generate LLM outputs outside the VM and load the
+  resulting table into HDFS, with one notebook that replays the analysis
+  from these saved real outputs (plus a small live smoke test)?
+
+- Is it acceptable that you store a copy of CNN/DailyMail on your
+  computers, given the rights on the underlying news text?
+
+**GitHub:** \[link to be added\]
